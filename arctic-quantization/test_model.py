@@ -3,11 +3,7 @@ import os
 import re
 from pathlib import Path
 
-from huggingface_hub import snapshot_download
-from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
-
-from common import DEFAULT_GPTQ8_DIR, DEFAULT_GPTQ8_REPO_ID, ensure_hf_token
+from common import DEFAULT_GPTQ8_DIR, DEFAULT_GPTQ8_REPO_ID, load_hf_token
 from prompts import QUESTIONS, SYSTEM_PROMPT, build_user_prompt
 
 
@@ -29,7 +25,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def resolve_model_source(args):
+def resolve_model_source(args, snapshot_download):
     model_source = args.model
     tokenizer_source = args.tokenizer or args.model
     if not args.from_hub:
@@ -37,12 +33,11 @@ def resolve_model_source(args):
 
     cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    token = ensure_hf_token()
+    token = load_hf_token()
     model_source = snapshot_download(
         repo_id=args.model,
         local_dir=str(cache_dir),
         token=token,
-        local_dir_use_symlinks=False,
     )
     tokenizer_source = model_source if args.tokenizer is None else args.tokenizer
     return model_source, tokenizer_source
@@ -60,7 +55,11 @@ def main():
     if args.cuda_visible_devices:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
 
-    model_source, tokenizer_source = resolve_model_source(args)
+    from huggingface_hub import snapshot_download
+    from transformers import AutoTokenizer
+    from vllm import LLM, SamplingParams
+
+    model_source, tokenizer_source = resolve_model_source(args, snapshot_download)
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_source,
         fix_mistral_regex=True,
@@ -97,7 +96,7 @@ def main():
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=True,
-        hf_token=ensure_hf_token() if args.from_hub else None,
+        hf_token=load_hf_token(),
         trust_remote_code=True,
     )
 

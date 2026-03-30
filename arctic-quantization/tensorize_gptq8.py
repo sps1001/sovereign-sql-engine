@@ -3,12 +3,6 @@ import os
 import shutil
 from pathlib import Path
 
-from vllm.engine.arg_utils import EngineArgs
-from vllm.model_executor.model_loader.tensorizer import (
-    TensorizerConfig,
-    tensorize_vllm_model,
-)
-
 from common import DEFAULT_GPTQ8_DIR, DEFAULT_GPTQ8_REPO_ID, DEFAULT_TENSORIZED_DIR
 
 
@@ -30,6 +24,10 @@ def copy_model_artifacts(source_dir: Path, target_dir: Path):
             continue
         if path.name == "model.tensors":
             continue
+        if path.suffix == ".safetensors":
+            continue
+        if path.name.startswith("pytorch_model") and path.suffix == ".bin":
+            continue
         if path.is_file():
             shutil.copy2(path, target_dir / path.name)
 
@@ -38,6 +36,12 @@ def main():
     args = parse_args()
     if args.cuda_visible_devices:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.model_executor.model_loader.tensorizer import (
+        TensorizerConfig,
+        tensorize_vllm_model,
+    )
 
     source_dir = Path(args.source_dir)
     target_dir = Path(args.output_dir)

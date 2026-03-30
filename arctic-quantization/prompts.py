@@ -72,7 +72,7 @@ QUESTIONS = [
     "List all resources that have never recorded any usage in the usage_metrics table.",
     "Find the total billing amount per industry for the first quarter of 2026.",
     "List resources where the cpu_utilization_avg was consistently below 10% (0.1) for the last 30 days.",
-    "Find organizations that have 'Active' resources but have not been generated an invoice for the current billing period.",
+    "Find organizations that have 'Active' resources but have not been invoiced for the current billing period.",
     "Identify the Top User for each organization (the user who logged in most recently).",
     "For each region, find which resource_type accounts for the highest total hourly_cost.",
     "List 'Startup' tier organizations whose total resource spend in a single month exceeded $5,000.",
