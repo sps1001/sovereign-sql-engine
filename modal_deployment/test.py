@@ -241,8 +241,10 @@ def test_invalid_model_error(base_url: str, verbose: bool = False) -> None:
             },
             timeout=30,
         )
-        passed = resp.status_code >= 400
-        detail = f"status={resp.status_code}" if verbose else ""
+        passed = 400 <= resp.status_code < 500
+        detail = f"status={resp.status_code}"
+        if verbose:
+            detail += f", body={resp.text[:200]!r}"
         record("Invalid Model Error Handling", passed, detail, time.time() - t0)
     except Exception as e:
         record("Invalid Model Error Handling", False, str(e), time.time() - t0)
@@ -260,8 +262,10 @@ def test_empty_messages_error(base_url: str, verbose: bool = False) -> None:
             },
             timeout=30,
         )
-        passed = resp.status_code >= 400
-        detail = f"status={resp.status_code}" if verbose else ""
+        passed = 400 <= resp.status_code < 500
+        detail = f"status={resp.status_code}"
+        if verbose:
+            detail += f", body={resp.text[:200]!r}"
         record("Empty Messages Error Handling", passed, detail, time.time() - t0)
     except Exception as e:
         record("Empty Messages Error Handling", False, str(e), time.time() - t0)

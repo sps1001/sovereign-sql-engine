@@ -16,6 +16,7 @@ import json
 import os
 import socket
 import subprocess
+import time
 from typing import Any
 
 import aiohttp
@@ -25,12 +26,15 @@ import modal
 # We express timeouts in minutes for readability, but Modal expects seconds.
 MINUTES = 60  # seconds per minute
 
+# Backoff settings for _wait_ready().
+WAIT_READY_INITIAL_BACKOFF = 0.5   # seconds; doubles each iteration
+WAIT_READY_MAX_BACKOFF = 5.0       # seconds; upper bound on per-iteration sleep
+
 # Port the vLLM HTTP server listens on inside the container.
 VLLM_PORT = 8000
 
 # HuggingFace model identifier.
 MODEL_NAME = "microsoft/Phi-4-mini-instruct"
-MODEL_REVISION = "main"
 
 # ---- Runtime configuration ------------------------------------------------
 # All of these can be overridden by setting environment variables *before*
@@ -93,20 +97,24 @@ with vllm_image.imports():
 def _sleep(level: int = 1) -> None:
     """Put the vLLM server into sleep mode, offloading weights to CPU RAM."""
     _requests.post(
-        f"http://localhost:{VLLM_PORT}/sleep?level={level}"
+        f"http://localhost:{VLLM_PORT}/sleep?level={level}",
+        timeout=60,
     ).raise_for_status()
 
 
 def _wake_up() -> None:
     """Bring the vLLM server back from sleep mode."""
-    _requests.post(f"http://localhost:{VLLM_PORT}/wake_up").raise_for_status()
+    _requests.post(f"http://localhost:{VLLM_PORT}/wake_up", timeout=60).raise_for_status()
 
 
-def _wait_ready(proc: subprocess.Popen) -> None:
+def _wait_ready(proc: subprocess.Popen, startup_timeout: int = 10 * MINUTES) -> None:
     """Block until the vLLM server is accepting TCP connections.
 
-    Raises RuntimeError if the process dies before becoming ready.
+    Raises RuntimeError if the process dies before becoming ready or if the
+    server does not become ready within *startup_timeout* seconds.
     """
+    deadline = time.monotonic() + startup_timeout
+    delay = WAIT_READY_INITIAL_BACKOFF
     while True:
         try:
             socket.create_connection(("localhost", VLLM_PORT), timeout=1).close()
@@ -116,6 +124,12 @@ def _wait_ready(proc: subprocess.Popen) -> None:
                 raise RuntimeError(
                     f"vLLM server exited unexpectedly with code {proc.returncode}"
                 )
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"vLLM server did not become ready within {startup_timeout}s"
+                )
+            time.sleep(delay)
+            delay = min(delay * 2, WAIT_READY_MAX_BACKOFF)
 
 
 def _warmup() -> None:
@@ -224,7 +238,21 @@ class Phi4Server:
     @modal.exit()
     def stop(self):
         """Terminate the vLLM subprocess cleanly."""
-        self.vllm_proc.terminate()
+        proc = getattr(self, "vllm_proc", None)
+        if not proc:
+            return
+
+        try:
+            if proc.poll() is not None:
+                return
+
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        except Exception as e:
+            print(f"Error while terminating vLLM subprocess: {e}")
 
 
 # ---- Local entrypoint -------------------------------------------------------

@@ -2,7 +2,7 @@
 name = "phi4-modal-deployment"
 version = "1.0.0"
 description = "Production-ready Modal deployment of Microsoft Phi-4-mini-instruct with vLLM"
-readme = "README.md"
+readme = "../README.md"
 requires-python = ">=3.12"
 dependencies = [
     "aiohttp>=3.13.5",
