@@ -4,6 +4,7 @@ This script facilitates uploading GPTQ-8 or tensorized models to the Hugging Fac
 with proper authentication and optional privacy settings.
 """
 import argparse
+import logging
 from pathlib import Path
 
 from huggingface_hub import HfApi
@@ -14,7 +15,11 @@ from common import (
     DEFAULT_TENSORIZED_DIR,
     DEFAULT_TENSORIZED_REPO_ID,
     ensure_hf_token,
+    setup_logging,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -35,6 +40,7 @@ def parse_args():
     parser.add_argument("--repo-id", help="Destination Hugging Face model repo.")
     parser.add_argument("--private", action="store_true", help="Create the repo as private.")
     parser.add_argument("--commit-message", default="Upload Arctic model artifacts")
+    parser.add_argument("--log-level", default="INFO", help="Logging level for debugging.")
     return parser.parse_args()
 
 
@@ -65,13 +71,20 @@ def main():
     Validates local model exists, creates repository if needed, and uploads all files.
     """
     args = parse_args()
+    setup_logging(args.log_level)
     local_dir, repo_id = resolve_paths(args)
     if not local_dir.exists():
         raise FileNotFoundError(f"Local model folder not found at {local_dir.resolve()}.")
 
+    logger.info("Uploading model artifacts from %s to %s", local_dir.resolve(), repo_id)
+    logger.debug("Repository privacy: %s", "private" if args.private else "public")
+    logger.debug("Commit message: %s", args.commit_message)
+
     # Initialize Hugging Face API client with authentication token
     api = HfApi(token=ensure_hf_token())
+    logger.info("Ensuring repository exists")
     api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, private=args.private)
+    logger.info("Uploading folder contents")
     api.upload_folder(
         folder_path=str(local_dir),
         repo_id=repo_id,
@@ -79,7 +92,7 @@ def main():
         commit_message=args.commit_message,
     )
 
-    print(f"Pushed model to https://huggingface.co/{repo_id}")
+    logger.info("Pushed model to https://huggingface.co/%s", repo_id)
 
 
 if __name__ == "__main__":
