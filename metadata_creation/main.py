@@ -1,5 +1,6 @@
 import csv
 import io
+import logging
 import os
 import reprlib
 import sys
@@ -10,6 +11,12 @@ from pinecone.exceptions import PineconeException
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # Configuration
 metadata_conn_str = (
@@ -182,12 +189,15 @@ def get_pinecone_index():
 def index_metadata_in_pinecone(records):
     pinecone_records = [record for record in records if record["text"].strip()]
     if not pinecone_records:
-        print("No metadata descriptions found to index in Pinecone.")
+        logger.info("No metadata descriptions found to index in Pinecone.")
         return
+
+    logger.info("Indexing %d metadata records in Pinecone", len(pinecone_records))
 
     pinecone_client, pinecone_index = get_pinecone_index()
 
     for record_batch in chunked(pinecone_records, 96):
+        logger.debug("Generating embeddings for batch of %d records", len(record_batch))
         try:
             embeddings = pinecone_client.inference.embed(
                 model=PINECONE_EMBED_MODEL,
@@ -214,19 +224,24 @@ def index_metadata_in_pinecone(records):
 
         pinecone_index.upsert(vectors=vectors, namespace=PINECONE_NAMESPACE)
 
-    print(
-        f"Successfully indexed {len(pinecone_records)} metadata descriptions in Pinecone."
+    logger.info(
+        "Successfully indexed %d metadata descriptions in Pinecone",
+        len(pinecone_records),
     )
 
 
 def setup_and_import():
+    logger.info("Connecting to SQLite Cloud sources")
     metadata_conn = sqlitecloud.connect(metadata_conn_str)
     source_conn = sqlitecloud.connect(source_conn_str)
     table_descriptions = load_table_descriptions()
     pinecone_records = []
 
+    logger.info("Loaded table descriptions for %d tables", len(table_descriptions))
+
     metadata_conn.execute("DROP TABLE IF EXISTS column_metadata;")
     metadata_conn.execute("DROP TABLE IF EXISTS table_metadata;")
+    logger.info("Recreating metadata tables")
 
     metadata_conn.execute(
         """
@@ -262,11 +277,15 @@ def setup_and_import():
         ]
     )
 
+    logger.info("Found %d table CSV files in %s", len(csv_files), CSV_DIR)
+
     for filename in csv_files:
         table_name = filename.replace(".csv", "")
         table_description = table_descriptions.get(
             table_name, f"Formula 1 {table_name} records"
         )
+
+        logger.debug("Processing table %s from %s", table_name, filename)
 
         metadata_conn.execute(
             "INSERT INTO table_metadata (table_name, description) VALUES (?, ?)",
@@ -316,17 +335,19 @@ def setup_and_import():
 
                 pinecone_records.append(build_column_record(table_name, cleaned_row))
 
+        logger.info("Imported table metadata for %s", table_name)
+
     metadata_conn.commit()
     metadata_conn.close()
     source_conn.close()
 
-    print(f"Successfully indexed {len(csv_files)} tables in SQLite Cloud.")
+    logger.info("Successfully indexed %d tables in SQLite Cloud", len(csv_files))
     index_metadata_in_pinecone(pinecone_records)
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python main.py <csv_directory>")
+        logger.error("Usage: python main.py <csv_directory>")
         sys.exit(1)
 
     CSV_DIR = sys.argv[1]
