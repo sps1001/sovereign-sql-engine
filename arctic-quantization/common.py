@@ -3,7 +3,9 @@
 This module provides shared constants, paths, and helper functions used across
 the quantization, tensorization, and deployment scripts.
 """
+import logging
 import os
+import sys
 from pathlib import Path
 
 # Base model identifier from Hugging Face Hub
@@ -19,6 +21,27 @@ MODELS_DIR = PROJECT_ROOT / "models"
 DEFAULT_GPTQ8_DIR = MODELS_DIR / "arctic-text2sql-r1-7b-gptq8"  # GPTQ 8-bit quantized model
 DEFAULT_Q8_DIR = MODELS_DIR / "arctic-text2sql-r1-7b-q8"  # BitsAndBytes 8-bit quantized model
 DEFAULT_TENSORIZED_DIR = MODELS_DIR / "arctic-text2sql-r1-7b-gptq8-tensorized"  # vLLM tensorized model
+
+
+def setup_logging(level: str = "INFO") -> logging.Logger:
+    """Configure process-wide logging for the Arctic scripts.
+
+    Args:
+        level: Logging level name such as DEBUG, INFO, or WARNING.
+
+    Returns:
+        logging.Logger: Logger scoped to this package.
+    """
+    numeric_level = getattr(logging, level.upper(), None)
+    if not isinstance(numeric_level, int):
+        raise ValueError(f"Invalid log level: {level}")
+
+    logging.basicConfig(
+        level=numeric_level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stdout,
+    )
+    return logging.getLogger("arctic_quantization")
 
 
 def load_hf_token() -> str | None:
