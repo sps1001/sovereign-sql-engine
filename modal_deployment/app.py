@@ -1,8 +1,6 @@
 """
-Phi-4 and Llama Guard on Modal with vLLM
-
-Serves Microsoft Phi-4-mini-instruct and Llama-Guard-3-1B as
-serverless OpenAI-compatible APIs on Modal, backed by vLLM.
+Sovereign SQL Engine - Inference Node
+Phi-4 and Llama Guard on Modal with vLLM + Full OTLP Observability
 
 Usage:
     modal deploy app.py     # deploy as persistent endpoints
@@ -14,18 +12,18 @@ import os
 import socket
 import subprocess
 import time
+import threading
 from typing import Any
 
 import aiohttp
 import modal
 
 # -- Timing helper --
-# We express timeouts in minutes for readability, but Modal expects seconds.
 MINUTES = 60  # seconds per minute
 
 # Backoff settings for _wait_ready().
-WAIT_READY_INITIAL_BACKOFF = 0.5   # seconds; doubles each iteration
-WAIT_READY_MAX_BACKOFF = 5.0       # seconds; upper bound on per-iteration sleep
+WAIT_READY_INITIAL_BACKOFF = 0.5
+WAIT_READY_MAX_BACKOFF = 5.0
 
 # Port the vLLM HTTP server listens on inside the container.
 VLLM_PORT = 8000
@@ -35,24 +33,29 @@ PHI4_MODEL_NAME = "ByteMaster01/phi-4-mini-instruct-awq4"
 LLAMA_GUARD_MODEL_NAME = "ByteMaster01/llama-guard-3-1b-awq4"
 
 # ---- Runtime configuration ------------------------------------------------
-# All of these can be overridden by setting environment variables *before*
-# running `modal deploy`.  Defaults work fine for most use-cases.
 N_GPU = int(os.environ.get("N_GPU", "1"))
 MAX_MODEL_LEN_PHI4 = int(os.environ.get("MAX_MODEL_LEN_PHI4", "4096"))
-MAX_MODEL_LEN_LLAMA_GUARD = int(os.environ.get("MAX_MODEL_LEN_LLAMA_GUARD", "2084"))
+MAX_MODEL_LEN_LLAMA_GUARD = int(os.environ.get("MAX_MODEL_LEN_LLAMA_GUARD", "2048"))
 GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.90"))
 VLLM_QUANTIZATION = os.environ.get("VLLM_QUANTIZATION", "auto").strip().lower()
 VLLM_VERSION = os.environ.get("VLLM_VERSION", "0.19.0").strip()
 FLASHINFER_VERSION = os.environ.get("FLASHINFER_VERSION", "").strip()
 
-# Fast cold-start snapshotting optimization
+# Fast cold-start snapshotting
 ENABLE_SNAPSHOTS = os.environ.get("ENABLE_SNAPSHOTS", "1") == "1"
 
-SCALEDOWN_WINDOW = int(os.environ.get("SCALEDOWN_WINDOW", "1"))  # minutes
+SCALEDOWN_WINDOW = int(os.environ.get("SCALEDOWN_WINDOW", "10"))  # minutes
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "32"))
 
 # ---- Modal app -------------------------------------------------------------
 app = modal.App("phi4-and-llama-guard-inference")
+
+# Shared observability secret — create with Grafana Cloud OTLP credentials.
+OBSERVABILITY_SECRET_NAME = os.environ.get(
+    "MODAL_OBSERVABILITY_SECRET_NAME",
+    "grafana-cloud-observability",
+).strip()
+observability_secret = modal.Secret.from_name(OBSERVABILITY_SECRET_NAME)
 
 # ---- Container image -------------------------------------------------------
 vllm_image = (
@@ -65,36 +68,50 @@ vllm_image = (
             [
                 f"vllm=={VLLM_VERSION}",
                 "huggingface-hub==0.36.0",
+                "opentelemetry-api",
+                "opentelemetry-sdk",
+                "opentelemetry-exporter-otlp",
+                "prometheus-client",
+                "requests",
             ]
             + ([f"flashinfer-python=={FLASHINFER_VERSION}"] if FLASHINFER_VERSION else [])
         )
     )
-    .env(
-        {
-            # Enable high-performance Xet backend for faster weight downloads.
-            "HF_XET_HIGH_PERFORMANCE": "1",
-        }
-    )
+    .env({
+        # Enable high-performance Xet backend for faster weight downloads.
+        "HF_XET_HIGH_PERFORMANCE": "1",
+        # Standard OpenTelemetry metadata for Modal -> Grafana Cloud export.
+        "OTEL_SERVICE_NAME": "sovereign-sql-inference",
+        "OTEL_RESOURCE_ATTRIBUTES": "service.name=sovereign-sql-inference,deployment.environment=modal",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+        "OTEL_METRICS_EXPORTER": "otlp",
+        "OTEL_LOGS_EXPORTER": "otlp",
+        "OTEL_TRACES_EXPORTER": "otlp",
+    })
 )
 
-# When GPU memory snapshots are enabled we need vLLM's dev/sleep mode and a
-# single Torch Inductor compile thread (avoids snapshot compatibility issues).
+# Snapshot mode: dev mode + single compile thread for deterministic GPU
+# memory layout that can be snapshotted reliably.
 if ENABLE_SNAPSHOTS:
-    vllm_image = vllm_image.env(
-        {
-            "VLLM_SERVER_DEV_MODE": "1",
-            "TORCHINDUCTOR_COMPILE_THREADS": "1",
-        }
-    )
+    vllm_image = vllm_image.env({
+        "VLLM_SERVER_DEV_MODE": "1",
+        "TORCHINDUCTOR_COMPILE_THREADS": "1",
+    })
 
 # ---- Persistent volumes ----------------------------------------------------
-# Model weights and vLLM compilation artefacts survive container restarts.
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 
 # ---- In-container helpers ---------------------------------------------------
 with vllm_image.imports():
     import requests as _requests
+    from opentelemetry import _logs, metrics
+    from opentelemetry.sdk._logs import LoggerProvider
+    from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+    from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 
 
 def _sleep(level: int = 1) -> None:
@@ -131,10 +148,10 @@ def _wait_ready(proc: subprocess.Popen, startup_timeout: int = 10 * MINUTES) -> 
             delay = min(delay * 2, WAIT_READY_MAX_BACKOFF)
 
 
-def _warmup() -> None:
+def _warmup(model_alias: str = "llm") -> None:
     """Fire a handful of throwaway requests so CUDA graphs get compiled."""
     payload = {
-        "model": "llm",
+        "model": model_alias,
         "messages": [{"role": "user", "content": "Hello, who are you?"}],
         "max_tokens": 16,
     }
@@ -189,19 +206,70 @@ def _build_vllm_cmd(model_name: str, max_model_len: int) -> list[str]:
     return cmd
 
 
+# ---- Observability Bridge ---------------------------------------------------
+
+def start_observability_relay(proc: subprocess.Popen, service_label: str):
+    """Background threads to bridge vLLM stdout/metrics to Grafana Cloud OTLP."""
+
+    def log_relay():
+        log_exporter = OTLPLogExporter()
+        logger_provider = LoggerProvider()
+        logger_provider.add_log_record_processor(BatchLogRecordProcessor(log_exporter))
+        _logs.set_logger_provider(logger_provider)
+        logger = _logs.get_logger(f"vllm.{service_label}")
+
+        for line in iter(proc.stdout.readline, ""):
+            clean_line = line.strip()
+            if clean_line:
+                print(f"[{service_label}] {clean_line}")
+                logger.emit(
+                    body=clean_line,
+                    attributes={"service": service_label, "component": "vllm-engine"},
+                )
+
+    def metrics_relay():
+        metric_exporter = OTLPMetricExporter()
+        reader = PeriodicExportingMetricReader(metric_exporter, export_interval_millis=15_000)
+        meter_provider = MeterProvider(metric_readers=[reader])
+        metrics.set_meter_provider(meter_provider)
+        meter = metrics.get_meter(f"vllm.{service_label}")
+
+        running_reqs = meter.create_gauge("vllm.requests.running", unit="count")
+        vram_util = meter.create_gauge("vllm.vram.utilization", unit="percent")
+
+        while proc.poll() is None:
+            try:
+                time.sleep(15)
+                resp = _requests.get(f"http://localhost:{VLLM_PORT}/metrics", timeout=5)
+                if resp.status_code == 200:
+                    for line in resp.text.splitlines():
+                        if "vllm:num_requests_running" in line and not line.startswith("#"):
+                            running_reqs.set(float(line.split()[-1]))
+                        if "vllm:gpu_cache_usage_perc" in line and not line.startswith("#"):
+                            vram_util.set(float(line.split()[-1]))
+            except Exception:
+                pass  # never crash the relay
+
+    threading.Thread(target=log_relay, daemon=True).start()
+    threading.Thread(target=metrics_relay, daemon=True).start()
+
+
 # ---- Server classes ---------------------------------------------------------
 
 @app.cls(
     image=vllm_image,
+    secrets=[observability_secret],
     gpu=f"L4:{N_GPU}",
-    scaledown_window=10, #SCALEDOWN_WINDOW * MINUTES,
+    scaledown_window=SCALEDOWN_WINDOW * MINUTES,
     timeout=10 * MINUTES,
     volumes={
         "/root/.cache/huggingface": hf_cache_vol,
         "/root/.cache/vllm": vllm_cache_vol,
     },
     enable_memory_snapshot=ENABLE_SNAPSHOTS,
-    **({"experimental_options": {"enable_gpu_snapshot": True}} if ENABLE_SNAPSHOTS else {}),
+    **({
+        "experimental_options": {"enable_gpu_snapshot": True}
+    } if ENABLE_SNAPSHOTS else {}),
 )
 @modal.concurrent(max_inputs=MAX_CONCURRENT)
 class Phi4Server:
@@ -211,9 +279,15 @@ class Phi4Server:
     def start(self):
         cmd = _build_vllm_cmd(PHI4_MODEL_NAME, MAX_MODEL_LEN_PHI4)
         print("Starting vLLM (Phi-4):", " ".join(cmd))
-        self.vllm_proc = subprocess.Popen(cmd)
+
+        # PIPE stdout so the observability relay can forward lines to Loki
+        self.vllm_proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        start_observability_relay(self.vllm_proc, "phi4")
+
         _wait_ready(self.vllm_proc)
-        _warmup()
+        _warmup("llm")
 
         if ENABLE_SNAPSHOTS:
             _sleep()
@@ -233,11 +307,9 @@ class Phi4Server:
         proc = getattr(self, "vllm_proc", None)
         if not proc:
             return
-
         try:
             if proc.poll() is not None:
                 return
-
             proc.terminate()
             try:
                 proc.wait(timeout=10)
@@ -249,15 +321,18 @@ class Phi4Server:
 
 @app.cls(
     image=vllm_image,
+    secrets=[observability_secret],
     gpu=f"T4:{N_GPU}",
-    scaledown_window=10, #SCALEDOWN_WINDOW * MINUTES,
+    scaledown_window=SCALEDOWN_WINDOW * MINUTES,
     timeout=10 * MINUTES,
     volumes={
         "/root/.cache/huggingface": hf_cache_vol,
         "/root/.cache/vllm": vllm_cache_vol,
     },
     enable_memory_snapshot=ENABLE_SNAPSHOTS,
-    **({"experimental_options": {"enable_gpu_snapshot": True}} if ENABLE_SNAPSHOTS else {}),
+    **({
+        "experimental_options": {"enable_gpu_snapshot": True}
+    } if ENABLE_SNAPSHOTS else {}),
 )
 @modal.concurrent(max_inputs=MAX_CONCURRENT)
 class LlamaGuardServer:
@@ -267,9 +342,14 @@ class LlamaGuardServer:
     def start(self):
         cmd = _build_vllm_cmd(LLAMA_GUARD_MODEL_NAME, MAX_MODEL_LEN_LLAMA_GUARD)
         print("Starting vLLM (Llama Guard):", " ".join(cmd))
-        self.vllm_proc = subprocess.Popen(cmd)
+
+        self.vllm_proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        start_observability_relay(self.vllm_proc, "llama-guard")
+
         _wait_ready(self.vllm_proc)
-        _warmup()
+        _warmup("llm")
 
         if ENABLE_SNAPSHOTS:
             _sleep()
@@ -289,11 +369,9 @@ class LlamaGuardServer:
         proc = getattr(self, "vllm_proc", None)
         if not proc:
             return
-
         try:
             if proc.poll() is not None:
                 return
-
             proc.terminate()
             try:
                 proc.wait(timeout=10)
@@ -307,7 +385,7 @@ class LlamaGuardServer:
 
 @app.local_entrypoint()
 async def test(test_timeout: int = 10 * MINUTES):
-    """Run a basic health check and a single streamed inference request directly to both deployments."""
+    """Run a basic health check and a single streamed inference request to both deployments."""
     print("Fetching server URLs...")
     phi4_url = await Phi4Server().serve.get_web_url.aio()
     llama_guard_url = await LlamaGuardServer().serve.get_web_url.aio()
@@ -387,4 +465,4 @@ async def _stream_chat(
                     print(content, end="", flush=True)
             except (json.JSONDecodeError, KeyError, IndexError):
                 pass
-    print()  # newline after the streamed output
+    print()  # newline after streamed output

@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+import glob
+from urllib.parse import urlparse
 from typing import get_origin, get_args
 from torch.cuda import device_count
 from vllm import AsyncEngineArgs
@@ -58,6 +60,94 @@ DEFAULT_ARGS = {
     "spec_decoding_acceptance_method": "rejection_sampler",
     "stream_interval": 1,
 }
+
+LMCACHE_CONNECTOR_NAME = "LMCacheConnectorV1"
+
+
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _lmcache_requested() -> bool:
+    return _env_truthy("ENABLE_LMCACHE") or bool(os.getenv("LMCACHE_CONFIG_FILE"))
+
+
+def _lmcache_is_usable() -> bool:
+    try:
+        import lmcache.c_ops  # noqa: F401
+        return True
+    except Exception as exc:
+        logging.warning("LMCache native extension is unavailable; disabling LMCache. error=%s", exc)
+        return False
+
+
+def _build_lmcache_transfer_config() -> dict | None:
+    """Build vLLM KV transfer config for LMCache when requested.
+
+    LMCache uses the same vLLM kv_transfer_config hook for both local and
+    remote cache tiers. We only inject the connector when the operator has
+    explicitly opted into LMCache via env vars.
+    """
+    if not _lmcache_requested():
+        return None
+
+    try:
+        from vllm.config import KVTransferConfig
+    except Exception as exc:
+        logging.warning("LMCache requested but KVTransferConfig is unavailable: %s", exc)
+        return None
+
+    try:
+        config = KVTransferConfig(kv_connector=LMCACHE_CONNECTOR_NAME, kv_role="kv_both")
+        logging.info(
+            "Enabled LMCache integration with connector=%s, remote_url=%s",
+            LMCACHE_CONNECTOR_NAME,
+            os.getenv("LMCACHE_REMOTE_URL"),
+        )
+        return config
+    except Exception as exc:
+        logging.warning("Failed to build LMCache transfer config: %s", exc)
+        return None
+
+
+def _upstash_rest_to_redis_url() -> str | None:
+    """Convert Upstash REST credentials into the Redis TLS URI LMCache expects.
+
+    Upstash exposes a REST endpoint and token, but LMCache's Redis connector
+    speaks the Redis protocol. Upstash Redis also supports the Redis protocol
+    over TLS, so we derive the `rediss://` URI from the REST host.
+    """
+    rest_url = os.getenv("UPSTASH_REDIS_REST_URL")
+    token = os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("UPSTASH_REST_TOKEN")
+    if not rest_url or not token:
+        return None
+
+    parsed = urlparse(rest_url)
+    if parsed.scheme in {"rediss", "redis"}:
+        return rest_url
+
+    host = parsed.netloc or parsed.path
+    if not host:
+        return None
+    host = host.rstrip("/")
+    if ":" not in host:
+        host = f"{host}:6379"
+    return f"rediss://default:{token}@{host}"
+
+
+def _ensure_upstash_lmcache_env() -> None:
+    """Populate LMCache env vars from Upstash REST settings when present."""
+    if os.getenv("LMCACHE_REMOTE_URL"):
+        return
+
+    redis_url = _upstash_rest_to_redis_url()
+    if not redis_url:
+        return
+
+    os.environ["LMCACHE_REMOTE_URL"] = redis_url
+    os.environ.setdefault("LMCACHE_REMOTE_SERDE", "naive")
+    os.environ.setdefault("LMCACHE_USE_EXPERIMENTAL", "True")
+    logging.info("Configured LMCache remote storage from Upstash Redis REST env vars")
 
 
 def _resolve_field_type(field_type: type) -> type:
@@ -274,7 +364,11 @@ def _resolve_max_model_len(model, trust_remote_code=False, revision=None):
 
 
 def _resolve_cached_snapshot_path(model_id: str, cache_root: str | None = None) -> str | None:
-    """Resolve a Hugging Face snapshot path from the local RunPod cache if available."""
+    """Resolve a Hugging Face snapshot path from the local RunPod cache if available.
+    
+    Verifies that the snapshot directory contains actual weight files to avoid
+    loading from a broken/incomplete cache.
+    """
     if not model_id or "/" not in model_id:
         return None
 
@@ -287,11 +381,18 @@ def _resolve_cached_snapshot_path(model_id: str, cache_root: str | None = None) 
     refs_main = os.path.join(model_root, "refs", "main")
     snapshots_dir = os.path.join(model_root, "snapshots")
 
+    def has_weights(path):
+        patterns = ["*.safetensors", "*.bin", "*.pt", "pytorch_model.bin", "model.safetensors", "*.tensors"]
+        for p in patterns:
+            if glob.glob(os.path.join(path, p)):
+                return True
+        return False
+
     if os.path.isfile(refs_main):
         with open(refs_main, "r") as f:
             snapshot_hash = f.read().strip()
         candidate = os.path.join(snapshots_dir, snapshot_hash)
-        if os.path.isdir(candidate):
+        if os.path.isdir(candidate) and has_weights(candidate):
             logging.info("Resolved cached snapshot for %s: %s", model_id, candidate)
             return candidate
 
@@ -303,10 +404,16 @@ def _resolve_cached_snapshot_path(model_id: str, cache_root: str | None = None) 
     ]
     if not versions:
         return None
+    
+    # Sort to get the latest/alphabetically first, but filter for those with weights
     versions.sort()
-    chosen = os.path.join(snapshots_dir, versions[0])
-    logging.info("Resolved fallback cached snapshot for %s: %s", model_id, chosen)
-    return chosen
+    for v in versions:
+        candidate = os.path.join(snapshots_dir, v)
+        if has_weights(candidate):
+            logging.info("Resolved fallback cached snapshot for %s: %s", model_id, candidate)
+            return candidate
+
+    return None
 
 
 def _sanitize_hf_overrides(hf_overrides: dict) -> dict | None:
@@ -371,17 +478,24 @@ def get_engine_args():
         args["model"] = cached_model
         if original_model_name:
             args["served_model_name"] = original_model_name
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        logging.info("Using cached Hugging Face snapshot for model %s", original_model_name or cached_model)
+    else:
+        # If the model is not already cached, allow the first run to download it
+        # into the mounted HF cache so future runs can stay offline.
+        os.environ["HF_HUB_OFFLINE"] = "0"
+        os.environ["TRANSFORMERS_OFFLINE"] = "0"
+        logging.info("No cached model snapshot found; allowing online download to populate the mounted cache")
 
     if args.get("tokenizer"):
         cached_tokenizer = _resolve_cached_snapshot_path(args.get("tokenizer"))
         if cached_tokenizer:
             args["tokenizer"] = cached_tokenizer
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
     elif cached_model:
         args["tokenizer"] = cached_model
-
-    if cached_model:
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
     # Filter to valid engine args and drop sentinel empty values
     valid_fields = AsyncEngineArgs.__dataclass_fields__
@@ -409,7 +523,27 @@ def get_engine_args():
 
     if args.get("load_format") == "bitsandbytes":
         args["quantization"] = args["load_format"]
-    
+
+    # LMCache integration (remote KV cache via Redis / Upstash)
+    lmcache_requested = _lmcache_requested()
+    lmcache_usable = False
+    if lmcache_requested:
+        _ensure_upstash_lmcache_env()
+        lmcache_usable = _lmcache_is_usable()
+        if lmcache_usable and not args.get("quantization"):
+            args["quantization"] = "bitsandbytes"
+            logging.info("LMCache requested without quantization; defaulting to bitsandbytes 4-bit quantization")
+        if os.getenv("LMCACHE_REMOTE_URL"):
+            logging.info("LMCache remote cache URL configured: %s", os.getenv("LMCACHE_REMOTE_URL"))
+        if not lmcache_usable:
+            os.environ.pop("LMCACHE_REMOTE_URL", None)
+            os.environ.pop("LMCACHE_USE_EXPERIMENTAL", None)
+            logging.warning("Skipping LMCache kv_transfer_config because the native extension is incompatible with this image")
+    if lmcache_usable:
+        lmcache_transfer_config = _build_lmcache_transfer_config()
+        if lmcache_transfer_config is not None and "kv_transfer_config" not in args:
+            args["kv_transfer_config"] = lmcache_transfer_config
+
     # Set tensor parallel size and max parallel loading workers if more than 1 GPU is available
     num_gpus = device_count()
     if num_gpus > 1:
