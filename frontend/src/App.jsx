@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
-import { streamPipeline, submitFeedback } from './lib/pipeline'
+import { streamPipeline, submitFeedback } from './lib/pipeline.js'
 
 const initialPipelineState = {
   query: '',
@@ -35,10 +35,12 @@ function formatValue(value) {
 
 function eventTone(type, data) {
   if (type === 'pipeline.error') return 'danger'
+  if (type === 'execution.error') return 'danger'
   if (type === 'pipeline.complete') return 'success'
   if (type === 'guard' && data?.allowed === false) return 'danger'
   if (type === 'classification' && data?.label === 'out_of_topic') return 'warning'
   if (type === 'execution.remark' && data?.blocked_by_firewall) return 'danger'
+  if (type === 'runpod' && data?.runpod_response?.advanced_model) return 'live'
   return 'neutral'
 }
 
@@ -61,11 +63,15 @@ function eventSummary(type, data) {
     case 'schema':
       return 'Schema SQL prepared.'
     case 'runpod':
+      if (data?.runpod_response?.fixed) return 'SQL fixed (Self-Corrected by Qwen3).'
+      if (data?.runpod_response?.advanced_model) return 'SQL enhanced (Refined by Qwen3).'
       return data?.generated_sql ? 'Final SQL generated.' : 'No SQL returned.'
     case 'execution.remark':
       return data?.blocked_by_firewall
-        ? 'Firewall blocked execution.'
-        : data?.remark || 'Execution policy applied.'
+        ? 'Firewall blocked query.'
+        : data?.execution_sql ? 'Plan approved.' : 'No plan.'
+    case 'execution.error':
+      return `Execution Error: ${data?.error}`
     case 'execution.data':
       return data?.execution_data ? `Fetched ${data.execution_data.length} row(s).` : 'No rows returned.'
     case 'pipeline.complete':
@@ -92,9 +98,11 @@ function eventHeading(type) {
     case 'schema':
       return 'Schema SQL'
     case 'runpod':
-      return 'Final SQL'
+      return 'SQL Generation'
     case 'execution.remark':
       return 'Execution remark'
+    case 'execution.error':
+      return 'Execution Error'
     case 'execution.data':
       return 'Execution data'
     case 'pipeline.complete':
@@ -508,10 +516,14 @@ export default function App() {
                             ? (selectedEvent.data?.allowed ? 'Guardrail allowed' : 'Guardrail blocked')
                             : selectedEvent.type === 'classification'
                               ? (selectedEvent.data?.label === 'out_of_topic' ? 'Out of logic' : selectedEvent.data?.label || 'Unknown')
-                              : selectedEvent.type === 'execution.remark'
-                                ? (selectedEvent.data?.blocked_by_firewall ? 'Firewall block' : 'Execution allowed')
+                                : selectedEvent.type === 'execution.error'
+                                  ? 'Execution failed'
+                                  : selectedEvent.type === 'execution.remark'
+                                    ? (selectedEvent.data?.blocked_by_firewall ? 'Firewall block' : 'Execution allowed')
                                 : selectedEvent.type === 'runpod'
-                                  ? (selectedEvent.data?.generated_sql ? 'Final SQL ready' : 'No SQL')
+                                  ? (selectedEvent.data?.runpod_response?.fixed ? 'Self-Corrected (Qwen3)' 
+                                    : selectedEvent.data?.runpod_response?.advanced_model ? 'Enhanced (Qwen3)' 
+                                    : selectedEvent.data?.generated_sql ? 'Final SQL ready' : 'No SQL')
                                   : selectedEvent.type}
                         </strong>
                       </div>
