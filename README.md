@@ -1,212 +1,243 @@
-# Concurrent Lightweight Multi-Agent NL2Data Engine
+# Sovereign SQL Engine
 
-A lightweight multi-agent system for translating natural language queries into executable SQL and MongoDB queries, optimized for limited hardware resources (single CPU and ≤16GB RAM).
+Production-focused NL2SQL system with schema-aware retrieval, graph-based join expansion, guarded SQL generation, and optional streaming execution traces.
 
-**Authors:** Laksh Mendpara (B23CS1037), Sahil Preet Singh (B23CS1061)  
-**Date:** March 2025
+## Overview
 
-## Abstract
+Sovereign SQL Engine converts natural-language analytics questions into executable SQL through a staged pipeline:
 
-Natural language interfaces for databases (NL2SQL or NL2MongoDB) allow users to query structured data without writing database queries. Although large language models (LLMs) can generate queries from natural language, their performance degrades when database schemas contain many tables and relationships.
+1. Safety guardrail validation
+2. Query difficulty/topic classification
+3. Semantic retrieval of relevant schema metadata
+4. Neo4j join-path expansion across table relationships
+5. Compact schema assembly for prompt conditioning
+6. SQL generation through a hosted inference endpoint
+7. Read-only SQL firewall and controlled execution
+8. Observability persistence (request records, failures, feedback)
 
-This project proposes a lightweight multi-agent system that uses a graph-based representation of database schemas to identify relevant tables and reduce prompt size before query generation. Quantized language models running with llama.cpp are used for efficient inference, while a validation step checks generated queries before execution.
+The backend supports both single-shot JSON responses and live Server-Sent Events (SSE) streaming.
 
-## Project Objectives
+## Architecture At Runtime
 
-The system focuses on three main goals:
-
-- **Schema Filtering**: Use a graph representation of the database schema to identify the most relevant tables for a given query.
-- **Concurrent Query Handling**: Support multiple user requests using asynchronous request handling.
-- **Query Validation**: Verify generated queries in a controlled environment before executing them on the target database.
-
-## System Architecture
-
-```
-User Query
-    ↓
-   FastAPI Gateway
-    ↓
-┌───────────────────────────────────┐
-│ Intent Agent                      │
-└───────────────────────────────────┘
-    ↓
-┌───────────────────────────────────┐
-│ Table Selection Agent             │
-│ (Neo4j Schema Graph)              │
-└───────────────────────────────────┘
-    ↓
-┌───────────────────────────────────┐
-│ Query Generator                   │
-│ (Quantized LLM)                   │
-└───────────────────────────────────┘
-    ↓
-┌───────────────────────────────────┐
-│ Validation Agent                  │
-└───────────────────────────────────┘
-    ↓
-  Database
+```text
+Client Query
+        |
+        v
+FastAPI Backend (/v1/pipeline/query or /v1/pipeline/stream)
+        |
+        +-- parallel: Guard + Classifier + Pinecone Retrieval
+                                             |
+                                             +--> Neo4j join expansion
+                                                             |
+                                                             +--> Metadata schema builder
+                                                                             |
+                                                                             +--> RunPod SQL generation
+                                                                                             |
+                                                                                             +--> SQL firewall (read-only + limit policy)
+                                                                                                             |
+                                                                                                             +--> SQLite Cloud execution (optional)
+                                                                                                                             |
+                                                                                                                             +--> API response + observability upsert
 ```
 
-## Key Methodology
+## Core Capabilities
 
-### Graph-Based Schema Representation
+- Concurrent orchestration with per-stage timeouts
+- Safety-first gating (guardrail + SQL firewall)
+- Retrieval-augmented schema narrowing (Pinecone + SQLite metadata)
+- Join-aware table expansion using Neo4j graph traversal
+- OpenAI-compatible model invocation through RunPod/Modal endpoints
+- SSE event streaming for stage-by-stage UI updates
+- Structured JSON logging with request/trace/span correlation IDs
+- In-process latency histograms and readiness/liveness probes
+- Durable audit and feedback records in SQLite Cloud
 
-The database metadata (tables, columns, and relationships) is represented as a property graph in Neo4j.
+## Repository Structure
 
-- **Entity Identification**: Keywords extracted from the user query are matched with nodes in the schema graph.
-- **Relationship Traversal**: If multiple entities are referenced in a query, the system identifies a join path between them using graph traversal.
-- **Context Reduction**: Only the relevant subset of tables is provided to the language model, reducing prompt size and improving efficiency.
-
-### Concurrent Inference
-
-Inference is performed using quantized models running with llama-cpp-python. The server supports multiple inference slots that allow several requests to remain active simultaneously.
-
-**Throughput Equation:**
-$$\text{Throughput} = \frac{\text{Number of Slots}}{\text{Average Token Generation Time}}$$
-
-Although token generation is sequential on the CPU, asynchronous request handling ensures that multiple users can interact with the system without blocking.
-
-### Lightweight Language Models
-
-Small language models (1.5B–7B parameters) are used with 4-bit quantization to reduce memory usage. These models can generate accurate SQL queries when provided with well-structured schema context.
-
-## Project Structure
-
-```
+```text
 sovereign-sql-engine/
-├── vllm_worker/              # vLLM-based inference worker
-│   ├── src/
-│   │   ├── engine.py         # Core query generation engine
-│   │   ├── handler.py        # Request handling
-│   │   ├── engine_args.py    # Configuration
-│   │   ├── tokenizer.py      # Tokenization utilities
-│   │   ├── constants.py      # Constants and configs
-│   │   └── utils.py          # Utility functions
-│   ├── Dockerfile            # Container configuration
-│   ├── docker-bake.hcl       # Docker build configuration
-│   └── docs/                 # Documentation
-├── arctic-quantization/      # Model quantization utilities
-│   ├── quantize_bnb8.py      # 8-bit quantization
-│   ├── quantize_gptq8.py     # GPTQ quantization
-│   └── test_model.py         # Model testing
-├── metadata_creation/        # Schema graph creation
-│   ├── main.py               # Metadata extraction logic
-│   └── conn_test.py          # Database connection testing
-├── modal_deployment/         # Modal.com deployment
-│   ├── app.py                # Modal application
-│   └── test.py               # Tests
-└── README.md                 # This file
+├── backend/                  # FastAPI production pipeline API
+├── frontend/                 # React + Vite streaming UI
+├── pipeline_test/            # CLI pipeline checker (non-API path)
+├── metadata_creation/        # Metadata ingestion into SQLite Cloud
+├── modal_deployment/         # Modal vLLM OpenAI-compatible deployment
+├── model_quantization/       # Quantization/tensorization/publishing utilities
+└── vllm_worker/              # RunPod vLLM worker assets (Dockerized)
 ```
 
-## Libraries and Frameworks
+## Technology Stack
 
-- **Hugging Face** – model repository for SQL generation and instruction models
-- **llama-cpp-python** – CPU-based inference engine for quantized GGUF models
-- **Neo4j** – graph database for representing database schema relationships
-- **FastAPI** – backend framework for handling HTTP requests and managing asynchronous workflows
-- **LangGraph** – framework for coordinating interactions between system agents
-- **Docker** – containerization and deployment
-- **vLLM** – optimized inference engine for language models
+- API and orchestration: FastAPI, asyncio, Pydantic
+- Vector retrieval and reranking: Pinecone
+- Schema graph traversal: Neo4j
+- Metadata and query execution store: SQLite Cloud
+- Hosted generation endpoints: RunPod + Modal-compatible OpenAI APIs
+- Frontend: React, Vite, SSE client parsing
+- Deployment assets: Docker (worker), Modal deployment scripts
 
-## Datasets and Models
-
-### Datasets
-- **Spider 1.0**: Large-scale domain-specific semantic parsing dataset
-- **BIRD Benchmark**: A large-scale text-to-SQL benchmark with diverse databases
-
-### Models
-- **SQLCoder-7B** (GGUF format) – for SQL query generation
-- **Qwen-2.5-1.5B-Instruct** – for intent detection and routing
-
-## Implementation Stages
-
-1. **Schema Graph Construction**: Extract metadata from the database and store it in Neo4j
-2. **Model Setup**: Deploy quantized language models using llama.cpp or vLLM
-3. **Agent Pipeline Development**: Implement the sequence of agents for intent detection, table selection, query generation, and validation
-4. **API Integration**: Build FastAPI endpoints to expose the query translation service
-5. **Frontend Interface**: Develop a web interface to submit queries and display generated SQL and execution results
-6. **Deployment**: Containerize and deploy using Docker
-
-## Getting Started
+## Quick Start
 
 ### Prerequisites
-- Python 3.8+
-- Docker (optional, for containerized deployment)
-- Neo4j (for schema graph storage)
-- 16GB RAM (minimum recommended)
 
-### Installation
+- Python 3.12+
+- Node.js 18+
+- uv (Python package manager)
+- Access credentials for:
+    - SQLite Cloud
+    - Pinecone
+    - Neo4j
+    - RunPod endpoint
+    - Guard and classifier model endpoints
 
-```bash
-# Clone the repository
-git clone <repository-url>
-cd sovereign-sql-engine
+### 1) Configure Environment
 
-# Install dependencies for vLLM worker
-cd vllm_worker
-pip install -r builder/requirements.txt
-
-# Install quantization utilities
-cd ../arctic-quantization
-pip install -e .
-
-# Install metadata creation tools
-cd ../metadata_creation
-pip install -e .
-```
-
-### Running the System
-
-Each component can be run independently:
+Create backend env from pipeline template and complete missing fields:
 
 ```bash
-# Start the vLLM worker
-cd vllm_worker
-python -m src.engine
-
-# Setup schema graph (requires Neo4j running)
-cd metadata_creation
-python main.py --database-url <your-db-connection>
-
-# Test the inference pipeline
-cd arctic-quantization
-python test_model.py
+cp pipeline_test/.env.example backend/.env
 ```
 
-## Architecture Components
+Then edit `backend/.env` and ensure all required keys exist:
 
-### VLLMWorker (`vllm_worker/`)
-The core inference component handling query generation using optimized inference engines.
+- `DB_NAME`
+- `SQLITE_HOST`, `SQLITE_PORT`, `SQLITE_API_KEY`
+- `SQLITE_DB`
+- `SQLITE_METADATA_DB`
+- `SQLITE_LLM_OBSERVABILITY_DB`
+- `PINECONE_API_KEY`
+- `PINECONE_INDEX_NAME` or `PINECONE_INDEX_HOST`
+- `LLAMA_GUARD_URL`
+- `PHI4_URL`
+- `NEO4J_URL`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`
+- `RUNPOD_API_KEY`, `RUNPOD_ENDPOINT_ID`
 
-### Quantization Module (`arctic-quantization/`)
-Utilities for quantizing models to 4-bit or 8-bit precision for efficient inference on CPU.
+Notes:
 
-### Metadata Creation (`metadata_creation/`)
-Extracts database schema information and constructs the Neo4j graph representation.
+- `backend` reads from `backend/.env`.
+- `pipeline_test` reads from its local `.env` when run directly.
 
-### Deployment (`modal_deployment/`)
-Cloud-ready deployment configuration using Modal.com for serverless inference.
+### 2) Run Backend
 
-## Performance Characteristics
+```bash
+cd backend
+uv sync
+PYTHONPATH=.. uv run start
+```
 
-- **Memory Usage**: ≤16GB RAM for complete system
-- **Inference Speed**: Token generation on single CPU with multiple concurrent slots
-- **Model Support**: 1.5B–7B parameter models with 4-bit quantization
-- **Supported Databases**: SQL (MySQL, PostgreSQL, etc.) and MongoDB
+Default URL: `http://localhost:8000`
 
-## Contributing
+### 3) Run Frontend
 
-Contributions are welcome! Please ensure:
-- Code follows the project structure
-- Models are in GGUF format
-- Tests pass before submitting PRs
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Default URL: `http://localhost:5173`
+
+## API Endpoints
+
+### Pipeline
+
+- `POST /v1/pipeline/query`
+    - Runs full pipeline and returns one JSON response.
+
+- `POST /v1/pipeline/stream`
+    - Streams stage events via SSE (`pipeline.start`, `guard`, `classification`, `pinecone`, `neo4j`, `schema`, `runpod`, `execution.remark`, `execution.data`, `pipeline.complete`).
+
+- `POST /v1/pipeline/feedback`
+    - Records user feedback and logical failure annotations.
+
+### Observability and Health
+
+- `GET /health` (liveness)
+- `GET /ready` (dependency readiness)
+- `GET /metrics` (in-process counters/histograms)
+- `GET /docs` and `GET /redoc` (OpenAPI docs)
+
+## Example Requests
+
+Run full JSON pipeline:
+
+```bash
+curl -X POST http://localhost:8000/v1/pipeline/query \
+    -H "Content-Type: application/json" \
+    -d '{"query": "Which drivers won the most races in 2022?"}'
+```
+
+Stream pipeline via SSE:
+
+```bash
+curl -N -X POST http://localhost:8000/v1/pipeline/stream \
+    -H "Content-Type: application/json" \
+    -d '{"query": "List top 10 constructors by total points."}'
+```
+
+## Component Notes
+
+### `backend/`
+
+Production FastAPI service with:
+
+- Async pipeline executor and SSE executor
+- Dependency-injected service clients
+- SQL firewall and execution planning
+- Persistent observability records
+
+See: `backend/README.md`
+
+### `frontend/`
+
+Streaming UI for inspecting each pipeline stage, SQL outputs, execution results, and metrics.
+
+See: `frontend/README.md`
+
+### `pipeline_test/`
+
+CLI path to run a single end-to-end query without API server:
+
+```bash
+python -m pipeline_test.main "your natural-language query"
+```
+
+### `metadata_creation/`
+
+Ingests table/column metadata from CSV descriptions into SQLite Cloud metadata tables used by retrieval and schema assembly.
+
+### `modal_deployment/`
+
+Deploys OpenAI-compatible inference endpoints (for guard/classifier or other model-serving roles) on Modal with GPU-backed vLLM.
+
+### `model_quantization/`
+
+Scripts for quantization workflows, tensorization, model testing, and publishing model artifacts.
+
+### `vllm_worker/`
+
+RunPod-oriented vLLM worker and Docker assets for serverless-compatible model serving.
+
+## Scalability and Reliability Design
+
+- Parallel stage fan-out reduces tail latency
+- Per-stage + global timeouts prevent request starvation
+- Early exits on blocked/out-of-topic queries reduce compute load
+- Externalized model serving (RunPod/Modal) decouples heavy inference from API layer
+- Thread-safe service clients used via `asyncio.to_thread`
+- Structured telemetry enables root-cause analysis by request and stage
+
+## Current Limitations and Next Steps
+
+- Heavy dependence on external managed services (Pinecone/Neo4j/RunPod)
+- End-to-end local development requires complete credential setup
+- MLOps lifecycle tooling (experiment registry/evaluation dashboards) is partial and can be expanded
+
+Suggested improvements:
+
+- Add Docker Compose for local backend + frontend + optional mocks
+- Add CI for linting/tests and smoke checks
+- Add automated SQL AST validation and offline regression suite
 
 ## License
 
-See [LICENSE](LICENSE) file for details.
-
-## References
-
-- Spider 1.0 Dataset: https://spider.ws/
-- BIRD Benchmark: https://bird-bench.github.io/
-- llama-cpp-python: https://github.com/abetlen/llama-cpp-python
+See `LICENSE`.
